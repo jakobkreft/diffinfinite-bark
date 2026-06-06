@@ -1,0 +1,22 @@
+# Core deep-learning stack
+torch>=2.0
+torchvision>=0.15
+
+# Diffusion / training utilities
+diffusers>=0.18
+accelerate>=0.20
+ema-pytorch>=0.2
+
+# Misc
+einops>=0.6
+fire>=0.5
+pyyaml>=6.0
+tqdm>=4.65
+
+# Data / image processing
+numpy>=1.23
+pandas>=2.0
+scikit-learn>=1.2
+scikit-image>=0.20
+pillow>=9.5
+matplotlib>=3.7

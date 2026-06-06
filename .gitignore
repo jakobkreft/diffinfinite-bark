@@ -1,0 +1,35 @@
+.idea
+.ipynb_checkpoints/
+__pycache__/
+*/__pycache__/
+
+models/
+data/
+download_script.py
+
+# Training results and checkpoints
+results/
+*.pt
+
+# Working notes (not for publication)
+notes/
+
+# Local archive of generated outputs (kept on disk, never committed)
+generated_outputs/
+
+# Any loose PNG at repo root — only tracked PNGs live under images/
+/*.png
+!images/**/*.png
+
+# Legacy generated-image patterns, root-anchored so they don't shadow images/showcase/
+/generated_sample.png
+/generated_mask*.png
+/torus_output*.png
+/g_mask*.png
+
+# External mask sources
+MRF_masks/
+qr_code_masks/
+
+# Distribution / compiled artifacts
+dist/
