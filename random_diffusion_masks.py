@@ -131,19 +131,22 @@ class RandomDiffusionMasks:
         img0=torch.randn(b,4,image_size//8,image_size//8)
         p=self.patch_size//16
         s=image_size//8
-        
-        while times.float().mean()!=(self.sampling_steps-1):
-            sys.stdout.flush()        
+
+        # Loop while any cell still needs a denoising step. Robust integer
+        # min instead of float mean — see note in RandomDiffusion.__call__.
+        target = self.sampling_steps - 1
+        while times.min().item() < target:
+            sys.stdout.flush()
             random_indices=self.get_value_coordinates(times[0,0])[0]
             i,j=torch.clamp(random_indices,p,s-p).tolist()
-            print(f"\r Generation {times.float().mean()*100/(self.sampling_steps-1):.2f}%, indices=[{(i-p)*8:04d}:{(i+p)*8:04d},{(j-p)*8:04d}:{(j+p)*8:04d}]",end="")
-            
+            print(f"\r Generation {times.float().mean()*100/target:.2f}%, indices=[{(i-p)*8:04d}:{(i+p)*8:04d},{(j-p)*8:04d}:{(j+p)*8:04d}]",end="")
+
             sub_img=self.random_crop(img0, i, j)
             sub_img_stack=self.random_crop(img_stack, i, j)
             sub_time=self.random_crop(times, i, j)
             sub_mask=self.random_crop(masks, i, j, latent=False)
-            
-            if sub_time.float().mean()!=(self.sampling_steps-1):
+
+            if sub_time.min().item() < target:
                 sub_img=self.sample_one(sub_img, sub_img_stack, sub_mask, sub_time)
 
                 mask_changed=torch.where(sub_time==sub_time.min(), 1 ,0)

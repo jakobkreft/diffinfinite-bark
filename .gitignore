@@ -30,6 +30,9 @@ generated_outputs/
 # External mask sources
 MRF_masks/
 qr_code_masks/
+MRF_32_masks/
+MRF_512_masks/
+test_masks/
 
 # Distribution / compiled artifacts
 dist/

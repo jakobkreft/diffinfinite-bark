@@ -27,7 +27,7 @@ from ema_pytorch import EMA
 
 from accelerate import Accelerator
 
-from dataset import import_dataset, ComposeState, RandomRotate90
+from dataset import import_external_split, ComposeState, RandomRotate90
 from utils.helpers import *
 from utils.modules import *
 
@@ -581,6 +581,10 @@ class GaussianDiffusion(nn.Module):
         target=torch.nan_to_num(target)
         loss = self.loss_fn(model_out, target, reduction = 'none')
         loss = reduce(loss, 'b ... -> b (...)', 'mean')
+        # Stash per-sample, p2-unweighted, mean-over-pixels loss for bucket
+        # tracking. The Trainer reads these on every step and bins by t.
+        self._last_per_sample_loss = loss.detach()
+        self._last_t = t.detach()
         loss = loss * extract(self.p2_loss_weight, t, loss.shape)
         return loss.mean()
 
@@ -610,13 +614,15 @@ class Trainer(object):
         save_loss_every = 100,
         num_workers = 0,
         num_samples = 4,
-        data_folder = None,
+        train_folder = None,
+        test_folder = None,
         results_folder = './results',
         amp = False,
         fp16 = False,
         split_batches = True,
         convert_image_to = None,
         out_size=None,
+        use_color_jitter = True,
     ):
         super().__init__()
 
@@ -642,17 +648,44 @@ class Trainer(object):
         self.image_size = diffusion_model.image_size
         self.cond_scale = cond_scale
 
-        if data_folder:
-            transform=ComposeState([
-                        T.ToTensor(),
-                        T.RandomHorizontalFlip(),
-                        T.RandomVerticalFlip(),
-                        RandomRotate90(),
-                        ])
+        if train_folder:
+            # Training pipeline: random 512 crop (full ±25% jitter against a
+            # 1024 source, or no-op if source already 512), full spatial
+            # augmentations (flips + rot90), then color jitter on the image
+            # only (mask is integer class labels and would be destroyed).
+            train_transform = ComposeState([
+                T.RandomCrop(self.image_size * 8),  # latent_size=64 → image_size=512
+                T.ToTensor(),
+                T.RandomHorizontalFlip(),
+                T.RandomVerticalFlip(),
+                RandomRotate90(),
+            ])
+            # Image-only color augmentation. Toggle via --use_color_jitter.
+            # Disabling is useful for fine-tuning from a checkpoint where the
+            # color distribution has drifted too far from real bark.
+            if use_color_jitter:
+                image_only_transform = T.ColorJitter(
+                    brightness=0.2, contrast=0.2, saturation=0.1, hue=0.02,
+                )
+            else:
+                image_only_transform = None
 
-            train_loader, test_loader = import_dataset(data_folder,
-                                                batch_size=train_batch_size,   
-                                                transform=transform)
+            # Eval pipeline (visualization only): deterministic center crop,
+            # no augmentations. Lets the same sample evolve across milestones.
+            eval_transform = ComposeState([
+                T.CenterCrop(self.image_size * 8),
+                T.ToTensor(),
+            ])
+
+            train_loader, test_loader = import_external_split(
+                train_folder=train_folder,
+                test_folder=test_folder,  # may be None: eval loader pulls from train
+                batch_size=train_batch_size,
+                num_workers=num_workers,
+                train_transform=train_transform,
+                eval_transform=eval_transform,
+                image_only_transform=image_only_transform,
+            )
 
             train_loader, test_loader = self.accelerator.prepare(train_loader,test_loader)
             self.dl = cycle(train_loader)
@@ -675,18 +708,45 @@ class Trainer(object):
         self.running_loss=[]
         self.running_lr=[]
 
+        # Per-timestep-bucket loss tracking. Five buckets covering the
+        # 1000-timestep range, each one captured as a running mean since the
+        # last flush. {bucket_idx: [mean_per_flush, ...]}.
+        self._n_buckets = 5
+        self.t_bucket_losses = {i: [] for i in range(self._n_buckets)}
+        # Accumulators reset every save_loss_every steps.
+        self._bucket_sum = [0.0] * self._n_buckets
+        self._bucket_n   = [0]   * self._n_buckets
+
         # CSV log file
         self.log_path = self.results_folder / 'training_log.csv'
         if not self.log_path.exists():
             with open(self.log_path, 'w') as f:
-                f.write('step,loss,lr\n')
+                cols = ['step', 'loss', 'lr'] + [f'loss_b{i}' for i in range(self._n_buckets)]
+                f.write(','.join(cols) + '\n')
 
         # prepare model, optimizer with accelerator
 
-        self.scheduler = lr_scheduler.OneCycleLR(self.opt, max_lr=train_lr, total_steps=train_num_steps)
+        # OneCycleLR (back to the upstream-faithful choice). Warms up from
+        # max_lr/25 to max_lr over the first 30% of training, then cosine-
+        # decays to ~max_lr/10000. The tail goes nearly to zero — the model
+        # effectively freezes in the last ~25% of steps. This is the
+        # accepted trade-off in the upstream paper.
+        self.scheduler = lr_scheduler.OneCycleLR(
+            self.opt,
+            max_lr=train_lr,
+            total_steps=train_num_steps,
+        )
         self.model, self.opt, self.ema, self.scheduler = self.accelerator.prepare(self.model, self.opt, self.ema, self.scheduler)
 
-        self.vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse")
+        # Diffusers 0.37+ sometimes fails to resolve repo names when the HF
+        # network handshake misbehaves, even though the model is fully
+        # cached. Fall back to local_files_only=True in that case.
+        try:
+            self.vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse")
+        except OSError:
+            self.vae = AutoencoderKL.from_pretrained(
+                "stabilityai/sd-vae-ft-mse", local_files_only=True
+            )
 
         self.vae = self.accelerator.prepare(self.vae)
 
@@ -702,6 +762,7 @@ class Trainer(object):
             'step': self.step,
             'loss': self.running_loss,
             'lr': self.running_lr,
+            't_bucket_losses': self.t_bucket_losses,
             'model': self.accelerator.get_state_dict(self.model),
             'opt': self.opt.state_dict(),
             'scheduler': self.scheduler.state_dict(),
@@ -728,6 +789,9 @@ class Trainer(object):
         self.ema.load_state_dict(data['ema'])
         self.running_loss = data['loss']
         self.running_lr = data['lr']
+        # Backwards-compatible: old checkpoints don't have bucket data.
+        if 't_bucket_losses' in data:
+            self.t_bucket_losses = data['t_bucket_losses']
 
         if exists(data['scaler']):
             self.accelerator.scaler.load_state_dict(data['scaler'])
@@ -748,6 +812,25 @@ class Trainer(object):
         self.opt.step()
         self.opt.zero_grad()
         self.scheduler.step()
+
+        # Accumulate per-timestep-bucket loss for the current micro-batch.
+        # Reaches the underlying GaussianDiffusion through the Accelerator
+        # wrapper (which forwards getattr).
+        model_unwrapped = self.accelerator.unwrap_model(self.model)
+        per_sample = getattr(model_unwrapped, '_last_per_sample_loss', None)
+        t_samples  = getattr(model_unwrapped, '_last_t', None)
+        if per_sample is not None and t_samples is not None:
+            n_buckets = self._n_buckets
+            num_t = getattr(self.accelerator.unwrap_model(self.model), 'num_timesteps', 1000)
+            bucket_size = num_t // n_buckets
+            # Flatten across any extra dims; reduce(..., 'b ... -> b (...)')
+            # leaves a (B, 1) tensor on some einops versions.
+            t_flat = t_samples.reshape(-1).cpu().tolist()
+            l_flat = per_sample.float().reshape(per_sample.shape[0], -1).mean(dim=-1).cpu().tolist()
+            for ti, li in zip(t_flat, l_flat):
+                b = min(int(ti) // bucket_size, n_buckets - 1)
+                self._bucket_sum[b] += float(li)
+                self._bucket_n[b]   += 1
 
         return loss
     
@@ -804,8 +887,24 @@ class Trainer(object):
                 if self.step % self.save_loss_every == 0:
                     self.running_loss.append(total_loss)
                     self.running_lr.append(self.scheduler.get_lr()[0])
+
+                    # Flush per-bucket means accumulated since last flush.
+                    bucket_means = []
+                    for b in range(self._n_buckets):
+                        if self._bucket_n[b] > 0:
+                            mean = self._bucket_sum[b] / self._bucket_n[b]
+                        else:
+                            mean = float('nan')
+                        bucket_means.append(mean)
+                        self.t_bucket_losses[b].append(mean)
+                    # Reset accumulators.
+                    self._bucket_sum = [0.0] * self._n_buckets
+                    self._bucket_n   = [0]   * self._n_buckets
+
                     with open(self.log_path, 'a') as f:
-                        f.write(f'{self.step},{total_loss},{self.scheduler.get_lr()[0]}\n')
+                        cols = [str(self.step), f'{total_loss}', f'{self.scheduler.get_lr()[0]}']
+                        cols += [f'{m}' for m in bucket_means]
+                        f.write(','.join(cols) + '\n')
 
                 pbar.set_description(f'loss: {total_loss:.4f}')
 

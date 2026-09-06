@@ -16,7 +16,11 @@ tqdm>=4.65
 # Data / image processing
 numpy>=1.23
 pandas>=2.0
+scipy>=1.10
 scikit-learn>=1.2
 scikit-image>=0.20
 pillow>=9.5
 matplotlib>=3.7
+
+# Evaluation (FID)
+torch-fidelity>=0.3

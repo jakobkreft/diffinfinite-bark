@@ -121,19 +121,25 @@ class RandomDiffusionTorus(RandomDiffusion):
         img0 = torch.randn(b, 4, latent_h, latent_w).to(self.device)
         p = self.patch_size // 16
 
-        while times.float().mean() != (self.sampling_steps - 1):
+        # Loop while any cell still needs a denoising step. Using integer
+        # min (not float mean) so termination is robust to float32 precision
+        # loss at large latent sizes — a 320×384 latent's sum-of-249s exceeds
+        # 2^24, so `.float().mean() == 249` can fail even when every cell is
+        # actually at 249, causing an infinite loop stuck at "100.00%".
+        target = self.sampling_steps - 1
+        while times.min().item() < target:
             sys.stdout.flush()
             random_indices = self.get_value_coordinates(times[0, 0])[0]
             # No clamping — allow any position, wrapping handles boundaries
             i, j = random_indices.tolist()
-            print(f"\r Generation {times.float().mean() * 100 / (self.sampling_steps - 1):.2f}%", end="")
+            print(f"\r Generation {times.float().mean() * 100 / target:.2f}%", end="")
 
             sub_img = self.random_crop(img0, i, j)
             sub_img_stack = self.random_crop(img_stack, i, j)
             sub_time = self.random_crop(times, i, j)
             sub_mask = self.random_crop(masks, i, j, latent=False)
 
-            if sub_time.float().mean() != (self.sampling_steps - 1):
+            if sub_time.min().item() < target:
                 sub_img = self.sample_one(sub_img, sub_img_stack, sub_mask, sub_time)
 
                 mask_changed = torch.where(sub_time == sub_time.min(), 1, 0).to(self.device)
@@ -260,19 +266,24 @@ class RandomDiffusionMasksTorus(RandomDiffusionMasks):
         img0 = torch.randn(b, 4, latent_h, latent_w)
         p = self.patch_size // 16
 
-        while times.float().mean() != (self.sampling_steps - 1):
+        # See note in RandomDiffusionTorus.__call__: robust integer-min
+        # termination instead of float-mean equality, which loses precision
+        # at latent counts above ~65k (sum of 249s overflows float32 exact
+        # integer range 2**24 and the comparison never becomes True).
+        target = self.sampling_steps - 1
+        while times.min().item() < target:
             sys.stdout.flush()
             random_indices = self.get_value_coordinates(times[0, 0])[0]
             # No clamping — wrapping handles boundaries
             i, j = random_indices.tolist()
-            print(f"\r Mask generation {times.float().mean() * 100 / (self.sampling_steps - 1):.2f}%", end="")
+            print(f"\r Mask generation {times.float().mean() * 100 / target:.2f}%", end="")
 
             sub_img = self.random_crop(img0, i, j)
             sub_img_stack = self.random_crop(img_stack, i, j)
             sub_time = self.random_crop(times, i, j)
             sub_mask = self.random_crop(masks, i, j, latent=False)
 
-            if sub_time.float().mean() != (self.sampling_steps - 1):
+            if sub_time.min().item() < target:
                 sub_img = self.sample_one(sub_img, sub_img_stack, sub_mask, sub_time)
 
                 mask_changed = torch.where(sub_time == sub_time.min(), 1, 0)
